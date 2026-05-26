@@ -33,7 +33,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib-detect.sh"
 
 STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
-RESURRECT_DIR="${HOME}/.tmux/resurrect"
+# Honor tmux-resurrect's @resurrect-dir option (with ~ expansion) instead of
+# hardcoding ${HOME}/.tmux/resurrect, so the assistant sidecar/logs live next
+# to the resurrect save files the user already configured.
+RESURRECT_DIR="$(tmux show-option -gqv @resurrect-dir 2>/dev/null || true)"
+RESURRECT_DIR="${RESURRECT_DIR:-${HOME}/.tmux/resurrect}"
+RESURRECT_DIR="${RESURRECT_DIR/#\~/$HOME}"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
 
