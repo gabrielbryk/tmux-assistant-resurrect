@@ -22,15 +22,17 @@ then re-launch them with the exact same configuration after a restore.
 
 ```
 SAVE (every 5 min + manual prefix+Ctrl-s)
-  tmux-resurrect saves pane layouts
-    -> post-save hook inspects child processes of each pane
+  tmux-resurrect stages a pane layout
+    -> post-save-layout hook inspects child processes of each pane
     -> detects assistants by binary name (claude, opencode, codex)
     -> extracts session IDs via native hooks/plugins/process args
-    -> writes ~/.tmux/resurrect/assistant-sessions.json
+    -> writes a schema-v2 tmux_resurrect_*.assistants.json manifest
+    -> layout + manifest hash are committed together by the `last` symlink
 
 RESTORE (on tmux start or manual prefix+Ctrl-r)
   tmux-resurrect restores pane layouts
-    -> post-restore hook reads assistant-sessions.json
+    -> post-restore hook derives the exact manifest selected by `last`
+    -> refuses injection unless the layout filename + SHA-256 match
     -> reconstructs full CLI invocation with saved flags + env vars
     -> sends resume commands to each pane, e.g.:
          ANTHROPIC_BASE_URL='...' claude --dangerously-skip-permissions --resume <id>
@@ -218,8 +220,10 @@ hook writes the session ID to disk automatically).
 
 Press `prefix + Ctrl-s` (the tmux-resurrect save keybinding). This saves the
 tmux layout **and** runs the assistant save hook, which detects running
-assistants and writes their session IDs to
-`~/.tmux/resurrect/assistant-sessions.json`.
+assistants and writes their session IDs to the versioned
+`tmux_resurrect_*.assistants.json` manifest paired with that layout.
+`assistant-sessions.json` is a compatibility symlink to the latest committed
+manifest.
 
 You can inspect what was saved:
 
@@ -231,7 +235,12 @@ Example output:
 
 ```json
 {
+  "schema_version": 2,
   "timestamp": "2026-02-15T20:34:28Z",
+  "layout": {
+    "file": "tmux_resurrect_20260215T203428.txt",
+    "sha256": "..."
+  },
   "sessions": [
     {
       "pane": "my-project:0.0",
@@ -342,9 +351,10 @@ export TMUX_ASSISTANT_RESURRECT_DIR=/path/to/state
 ```
 
 Note: state files are transient — they track running assistant PIDs and session
-IDs while tmux is active. The persistent sidecar JSON
-(`~/.tmux/resurrect/assistant-sessions.json`) is what survives reboots and lives
-in your home directory.
+IDs while tmux is active. The persistent versioned manifests
+(`~/.tmux/resurrect/tmux_resurrect_*.assistants.json`) survive reboots and live
+in your home directory. The latest 20 layout/manifest pairs are retained by
+default; change this with `@assistant-resurrect-retain-pairs`.
 
 ### Environment variable capture and restoration
 
@@ -466,14 +476,18 @@ matching binary names. Then extracts session IDs using tool-specific methods
 - **Model** (`model`): from state file (preferred) or `--model` in args (fallback)
 - **Environment** (`env`): from state file (captured by hooks/plugins)
 
-Writes everything to `~/.tmux/resurrect/assistant-sessions.json`.
+Writes a schema-v2 manifest containing the layout filename and SHA-256. Unsafe
+Codex launcher arguments (`codex-supervisor`, `--real-codex`, or a saved
+`resume`) abort the save instead of being persisted for replay.
 
 ### Restore hook (`scripts/restore-assistant-sessions.sh`)
 
-Runs after each tmux-resurrect restore. Reads the sidecar JSON and reconstructs
-the full CLI invocation for each assistant: `<env_prefix> <binary> <cli_args>
-<resume_arg>`. Sends the command to each pane via `tmux send-keys`. If enriched
-fields are missing (old-format JSON), falls back to bare resume commands.
+Runs after each tmux-resurrect restore. It accepts only the versioned manifest
+paired to the exact layout selected by `last`; a missing file or hash mismatch
+fails closed without sending commands. It reconstructs each invocation as
+`<env_prefix> <binary> <cli_args> <resume_arg>`, verifies the launched process
+and session identity, and writes `assistant-restore-report-*.json` with
+verified, awaiting-confirmation, failed, and skipped counts.
 
 ## Limitations
 

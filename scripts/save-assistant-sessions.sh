@@ -22,8 +22,11 @@ fi
 # Detection: inspects child processes of each tmux pane shell via ps.
 # Session IDs: extracted from process args, hook state files, or tool-native files.
 #
-# Called automatically by tmux-resurrect after each save via:
-#   set -g @resurrect-hook-post-save-all '/path/to/save-assistant-sessions.sh'
+# Called automatically by tmux-resurrect while the layout is still staged via:
+#   set -g @resurrect-hook-post-save-layout '/path/to/save-assistant-sessions.sh'
+# The staged layout path is passed as argv[1].  A second --finalize invocation
+# runs after pane-content capture to update the compatibility alias and prune
+# old manifests.
 
 set -euo pipefail
 
@@ -41,6 +44,9 @@ RESURRECT_DIR="${RESURRECT_DIR:-${HOME}/.tmux/resurrect}"
 RESURRECT_DIR="${RESURRECT_DIR/#\~/$HOME}"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
+LAYOUT_TMP_PATH=""
+LAYOUT_FINAL_PATH=""
+INVALID_CLI_ARGS=0
 
 mkdir -p -m 0700 "$STATE_DIR"
 mkdir -p "$RESURRECT_DIR"
@@ -58,6 +64,30 @@ log() {
 }
 
 USED_CODEX_SESSION_IDS=""
+
+sha256_file() {
+	local path="$1"
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$path" | awk '{print $1}'
+	else
+		shasum -a 256 "$path" | awk '{print $1}'
+	fi
+}
+
+manifest_for_layout() {
+	local layout="$1"
+	printf '%s.assistants.json\n' "${layout%.*}"
+}
+
+validate_cli_args() {
+	local tool="$1" args="$2"
+	[ "$tool" != "codex" ] && return 0
+
+	case " $args " in
+	*" codex-supervisor "* | *" --real-codex "* | *" resume "*) return 1 ;;
+	esac
+	return 0
+}
 
 # --- Session ID extraction ---
 
@@ -385,6 +415,17 @@ extract_cli_args() {
 		return
 	fi
 
+	# Defensive compatibility for saves made from a supervised Codex parent.
+	# Normal detection now selects the real Codex child, but older platforms or
+	# unusual process trees can still surface:
+	#   python3 codex-supervisor --real-codex /path/codex -- <real args>
+	# Everything through the supervisor's `--` delimiter is launcher-private.
+	if [ "$tool" = "codex" ]; then
+		case "$args" in
+		*codex-supervisor*" -- "*) args="${args#* -- }" ;;
+		esac
+	fi
+
 	# Node.js processes (claude, codex) may show a second token that is the
 	# script path, e.g. `claude /usr/local/bin/claude --resume ...`.
 	# Strip any leading token that is a path ending in the tool binary name.
@@ -409,8 +450,25 @@ extract_cli_args() {
 		args=$(echo "$args" | sed -E 's/--session[= ] *[^ ]*//; s/-s  *[^ ]*//')
 		;;
 	codex)
-		# resume <id> (positional)
-		args=$(echo "$args" | sed -E 's/resume  *[^ ]*//')
+		# Strip every resume subcommand and its positional ID.  A bare trailing
+		# resume is removed too, preventing `resume resume <id>` on replay.
+		local tokens=() normalized=() skip_next=0 token
+		read -r -a tokens <<<"$args"
+		for token in "${tokens[@]}"; do
+			if [ "$token" = "resume" ]; then
+				skip_next=1
+				continue
+			fi
+			if [ "$skip_next" -eq 1 ]; then
+				skip_next=0
+				case "$token" in
+				-*) ;;
+				*) continue ;;
+				esac
+			fi
+			normalized+=("$token")
+		done
+		args="${normalized[*]}"
 		;;
 	esac
 
@@ -478,6 +536,12 @@ resolve_pane_candidates() {
 			if [ -n "$session_id" ]; then
 				local cli_args model="" env_json="null" state_file=""
 				cli_args=$(extract_cli_args "$cand_tool" "$cand_args")
+				if ! validate_cli_args "$cand_tool" "$cli_args"; then
+					log "refusing unsafe $cand_tool CLI args in $pane_target: $cli_args"
+					INVALID_CLI_ARGS=1
+					resolved=1
+					break
+				fi
 				model="$cached_model"
 				env_json="$cached_env"
 
@@ -519,6 +583,18 @@ resolve_pane_candidates() {
 # --- Main ---
 
 main() {
+	local layout_arg="${1:-}"
+	if [ -n "$layout_arg" ]; then
+		if [ ! -s "$layout_arg" ]; then
+			log "layout staging file is missing or empty: $layout_arg"
+			return 1
+		fi
+		LAYOUT_TMP_PATH="$layout_arg"
+		LAYOUT_FINAL_PATH="${layout_arg%.tmp}"
+		OUTPUT_FILE="$(manifest_for_layout "$LAYOUT_FINAL_PATH")"
+		log "phase=assistant-scan layout=$(basename "$LAYOUT_FINAL_PATH")"
+	fi
+
 	PS_FILE=$(mktemp)
 	PANE_FILE=$(mktemp)
 	PARTS_FILE=$(mktemp)
@@ -572,9 +648,9 @@ main() {
 			# Keep patterns aligned with detect_tool() in lib-detect.sh:
 			# - bare binary at start, or path component (/tool)
 			# - opencode excludes "opencode run " subprocesses
-			if      (line ~ /(^claude( |$)|\/claude( |$))/)                                      proc_tool[pid] = "claude"
-			else if (line ~ /(^opencode( |$)|\/opencode( |$))/ && line !~ /opencode run /)       proc_tool[pid] = "opencode"
-			else if (line ~ /(^codex( |$)|\/codex( |$))/)                                        proc_tool[pid] = "codex"
+			if      (line ~ /^(claude|[^ ]*\/claude)( |$)/ || line ~ /^[^ ]+ (claude|[^ ]*\/claude)( |$)/)                                      proc_tool[pid] = "claude"
+			else if ((line ~ /^(opencode|[^ ]*\/opencode)( |$)/ || line ~ /^[^ ]+ (opencode|[^ ]*\/opencode)( |$)/) && line !~ /opencode run /) proc_tool[pid] = "opencode"
+			else if (line ~ /^(codex|[^ ]*\/codex)( |$)/ || line ~ /^[^ ]+ (codex|[^ ]*\/codex)( |$)/)                                        proc_tool[pid] = "codex"
 		}
 		END {
 			for (i = 1; i <= pane_count; i++) {
@@ -689,26 +765,44 @@ main() {
 		fi
 	fi
 
+	if [ "$INVALID_CLI_ARGS" -ne 0 ]; then
+		log "assistant manifest aborted because unsafe CLI args were detected"
+		return 1
+	fi
+
 	# Single jq: convert TSV to JSON array + build final output (replaces N+3 jq calls)
 	local count=0
+	local output_tmp="${OUTPUT_FILE}.tmp.$$"
+	local layout_sha="" layout_file=""
+	if [ -n "$LAYOUT_TMP_PATH" ]; then
+		layout_sha=$(sha256_file "$LAYOUT_TMP_PATH")
+		layout_file=$(basename "$LAYOUT_FINAL_PATH")
+	fi
 	if [ -s "$PARTS_FILE" ]; then
-		jq -Rs --arg ts "$SAVE_TS" '
+		jq -Rs --arg ts "$SAVE_TS" --arg layout_file "$layout_file" --arg layout_sha "$layout_sha" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
 			 env:(.[7] // "null" | try fromjson catch null)})
-			| {timestamp: $ts, sessions: .}
-		' "$PARTS_FILE" >"$OUTPUT_FILE"
-		count=$(jq '.sessions | length' "$OUTPUT_FILE")
+			| {schema_version: 2, timestamp: $ts,
+			   layout: (if $layout_file == "" then null else {file:$layout_file, sha256:$layout_sha} end),
+			   sessions: .}
+		' "$PARTS_FILE" >"$output_tmp"
+		count=$(jq '.sessions | length' "$output_tmp")
 	else
-		jq -n --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: []}' >"$OUTPUT_FILE"
+		jq -n --arg ts "$SAVE_TS" --arg layout_file "$layout_file" --arg layout_sha "$layout_sha" \
+			'{schema_version: 2, timestamp: $ts,
+			  layout: (if $layout_file == "" then null else {file:$layout_file, sha256:$layout_sha} end),
+			  sessions: []}' >"$output_tmp"
 	fi
+	jq -e '.schema_version == 2 and (.sessions | type == "array")' "$output_tmp" >/dev/null
+	mv -f "$output_tmp" "$OUTPUT_FILE"
 
-	log "saved $count assistant session(s) to $OUTPUT_FILE"
+	log "phase=manifest-promoted sessions=$count path=$OUTPUT_FILE"
 
 	# Strip captured pane contents for assistant panes so tmux-resurrect
 	# won't restore stale TUI output that the post-restore hook would
 	# immediately replace. Non-assistant pane contents are preserved.
-	if [ "$count" -gt 0 ]; then
+	if [ -z "$LAYOUT_TMP_PATH" ] && [ "$count" -gt 0 ]; then
 		strip_assistant_pane_contents
 	fi
 }
@@ -761,6 +855,81 @@ strip_assistant_pane_contents() {
 	fi
 
 	rm -rf "$tmpdir"
+}
+
+verify_paired_manifest() {
+	local layout="$1" manifest="$2"
+	[ -s "$layout" ] && [ -s "$manifest" ] || return 1
+	local expected_file expected_sha actual_sha
+	expected_file=$(jq -r '.layout.file // empty' "$manifest" 2>/dev/null) || return 1
+	expected_sha=$(jq -r '.layout.sha256 // empty' "$manifest" 2>/dev/null) || return 1
+	[ "$(jq -r '.schema_version // 0' "$manifest" 2>/dev/null)" = "2" ] || return 1
+	[ "$expected_file" = "$(basename "$layout")" ] || return 1
+	actual_sha=$(sha256_file "$layout")
+	[ -n "$expected_sha" ] && [ "$expected_sha" = "$actual_sha" ]
+}
+
+prune_paired_manifests() {
+	local retain
+	retain=$(tmux show-option -gqv @assistant-resurrect-retain-pairs 2>/dev/null || true)
+	case "$retain" in
+	'' | *[!0-9]* | 0) retain=20 ;;
+	esac
+
+	local last_layout=""
+	if [ -L "$RESURRECT_DIR/last" ]; then
+		last_layout="$RESURRECT_DIR/$(readlink "$RESURRECT_DIR/last")"
+	fi
+	local index=0 manifest layout
+	while IFS= read -r manifest; do
+		[ -n "$manifest" ] || continue
+		index=$((index + 1))
+		if [ "$index" -gt "$retain" ]; then
+			layout="${manifest%.assistants.json}.txt"
+			if [ "$layout" != "$last_layout" ]; then
+				rm -f "$manifest" "$layout"
+			fi
+		fi
+	done < <(ls -1t "$RESURRECT_DIR"/tmux_resurrect_*.assistants.json 2>/dev/null || true)
+
+	# Clean crash leftovers only after they are a day old.  A brand-new
+	# companion intentionally exists briefly before its layout is promoted.
+	while IFS= read -r manifest; do
+		layout="${manifest%.assistants.json}.txt"
+		[ -e "$layout" ] || rm -f "$manifest"
+	done < <(find "$RESURRECT_DIR" -type f -name 'tmux_resurrect_*.assistants.json' -mtime +0 2>/dev/null)
+}
+
+finalize_main() {
+	local last_link="$RESURRECT_DIR/last"
+	if [ ! -L "$last_link" ]; then
+		log "finalize skipped: no resurrect last symlink"
+		return 1
+	fi
+	local layout="$RESURRECT_DIR/$(readlink "$last_link")"
+	local manifest
+	manifest=$(manifest_for_layout "$layout")
+	if ! verify_paired_manifest "$layout" "$manifest"; then
+		log "finalize refused unmatched layout/manifest pair: $layout"
+		return 1
+	fi
+
+	local previous_count=0 current_count
+	if [ -r "$OUTPUT_FILE" ]; then
+		previous_count=$(jq '.sessions | length' "$OUTPUT_FILE" 2>/dev/null || echo 0)
+	fi
+	current_count=$(jq '.sessions | length' "$manifest")
+	if [ "$previous_count" -ge 4 ] && [ $((current_count * 2)) -lt "$previous_count" ]; then
+		log "warning: assistant count dropped from $previous_count to $current_count for a matching layout"
+	fi
+
+	ln -sfn "$(basename "$manifest")" "$OUTPUT_FILE"
+	OUTPUT_FILE="$manifest"
+	if [ "$current_count" -gt 0 ]; then
+		strip_assistant_pane_contents
+	fi
+	prune_paired_manifests
+	log "phase=finalized layout=$(basename "$layout") sessions=$current_count"
 }
 
 # Retained for backward compatibility — main() no longer calls this directly
@@ -824,5 +993,9 @@ emit_session() {
 # Allow sourcing this script without executing main (for unit tests).
 # When sourced, only functions and variables are defined.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-	main "$@"
+	if [ "${1:-}" = "--finalize" ]; then
+		finalize_main
+	else
+		main "${1:-}"
+	fi
 fi

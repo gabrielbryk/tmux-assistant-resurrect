@@ -113,6 +113,34 @@ assert_file_not_exists() {
 	fi
 }
 
+# Restore now accepts only a schema-v2 manifest paired to the exact layout
+# selected by `last`. Most integration tests construct session JSON directly,
+# so wrap `just restore` with a deterministic valid pair for that fixture.
+TEST_PAIR_SEQUENCE=0
+pair_test_manifest() {
+	local dir="$HOME/.tmux/resurrect"
+	local source="$dir/assistant-sessions.json"
+	[ -r "$source" ] || return 0
+	TEST_PAIR_SEQUENCE=$((TEST_PAIR_SEQUENCE + 1))
+	local layout="$dir/tmux_resurrect_test_pair_${TEST_PAIR_SEQUENCE}.txt"
+	local manifest="${layout%.*}.assistants.json"
+	printf 'window\ttest\t0\ttest\t1\t:\tb25d,80x24,0,0,0\n' >"$layout"
+	local sha
+	sha=$(sha256sum "$layout" | awk '{print $1}')
+	jq --arg file "$(basename "$layout")" --arg sha "$sha" \
+		'.schema_version = 2 | .layout = {file:$file, sha256:$sha}' \
+		"$source" >"${manifest}.tmp"
+	mv -f "${manifest}.tmp" "$manifest"
+	ln -sfn "$(basename "$layout")" "$dir/last"
+}
+
+just() {
+	if [ "${1:-}" = "restore" ]; then
+		pair_test_manifest
+	fi
+	command just "$@"
+}
+
 # Source shared detection library early (needed by wait_for_descendant and other helpers)
 source "$REPO_DIR/scripts/lib-detect.sh"
 
@@ -364,6 +392,22 @@ assert_eq "LSP subprocess excluded from detection" "0" "$lsp_count"
 false_positive_count=$(jq '[.sessions[] | select(.pane | contains("test-false-positive"))] | length' "$SAVED")
 assert_eq "Argument value 'codex' does not trigger false-positive detection" "0" "$false_positive_count"
 
+# Exercise the real staged-layout hook and finalize path used by the
+# transactional tmux-resurrect companion protocol.
+PAIR_LAYOUT="$HOME/.tmux/resurrect/tmux_resurrect_pair_contract.txt"
+PAIR_TMP="${PAIR_LAYOUT}.tmp"
+PAIR_MANIFEST="${PAIR_LAYOUT%.*}.assistants.json"
+printf 'window\ttest\t0\ttest\t1\t:\tb25d,80x24,0,0,0\n' >"$PAIR_TMP"
+bash "$REPO_DIR/scripts/save-assistant-sessions.sh" "$PAIR_TMP"
+pair_expected_sha=$(sha256sum "$PAIR_TMP" | awk '{print $1}')
+assert_eq "Paired manifest uses schema v2" "2" "$(jq -r '.schema_version' "$PAIR_MANIFEST")"
+assert_eq "Paired manifest names its exact layout" "$(basename "$PAIR_LAYOUT")" "$(jq -r '.layout.file' "$PAIR_MANIFEST")"
+assert_eq "Paired manifest hashes the staged layout" "$pair_expected_sha" "$(jq -r '.layout.sha256' "$PAIR_MANIFEST")"
+mv -f "$PAIR_TMP" "$PAIR_LAYOUT"
+ln -sfn "$(basename "$PAIR_LAYOUT")" "$HOME/.tmux/resurrect/last"
+bash "$REPO_DIR/scripts/save-assistant-sessions.sh" --finalize
+assert_eq "Finalize points compatibility alias at paired manifest" "$(basename "$PAIR_MANIFEST")" "$(readlink "$SAVED")"
+
 # Verify the log mentions the opencode without session ID
 LOG="$HOME/.tmux/resurrect/assistant-save.log"
 if grep -q "no session ID available" "$LOG"; then
@@ -443,6 +487,20 @@ for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp te
 	kill_pane_children "$sess"
 done
 sleep 1
+
+# A stale or corrupted companion must fail closed before any send-keys.
+MISMATCH_LAYOUT="$HOME/.tmux/resurrect/tmux_resurrect_mismatch.txt"
+MISMATCH_MANIFEST="${MISMATCH_LAYOUT%.*}.assistants.json"
+printf 'window\ttest\t0\ttest\t1\t:\tb25d,80x24,0,0,0\n' >"$MISMATCH_LAYOUT"
+jq --arg file "$(basename "$MISMATCH_LAYOUT")" \
+	'.schema_version = 2 | .layout = {file:$file, sha256:"not-the-layout-hash"}' \
+	"$SAVED" >"$MISMATCH_MANIFEST"
+ln -sfn "$(basename "$MISMATCH_LAYOUT")" "$HOME/.tmux/resurrect/last"
+>"$HOME/.tmux/resurrect/assistant-restore.log"
+bash "$REPO_DIR/scripts/restore-assistant-sessions.sh"
+assert_contains "Mismatched layout/manifest fails closed" "$(cat "$HOME/.tmux/resurrect/assistant-restore.log")" "refusing assistant restore"
+mismatch_report=$(ls -1t "$HOME/.tmux/resurrect"/assistant-restore-report-*.json | head -1)
+assert_eq "Mismatched layout/manifest reports one failure" "1" "$(jq -r '.summary.failed' "$mismatch_report")"
 
 # Run restore
 just restore 2>&1
@@ -1001,6 +1059,18 @@ STATE_DIR="$TEST_STATE_DIR"
 assert_eq "Codex resume extraction" "ses_codex_789" "$(get_codex_session 99999 "codex resume ses_codex_789")"
 assert_eq "Codex resume with path" "ses_codex_789" "$(get_codex_session 99999 "/usr/bin/codex resume ses_codex_789")"
 assert_eq "Codex bare (no resume)" "" "$(get_codex_session 99999 "codex")"
+
+# Supervisor argv must never be classified or replayed as Codex CLI args.
+supervised_codex="python3 /home/testuser/bin/codex-supervisor --real-codex /opt/codex -- --dangerously-bypass-approvals-and-sandbox resume 019f47de-a880-7ae2-b0c8-4c37471ac05a"
+assert_eq "Codex supervisor parent is not classified as Codex" "" "$(detect_tool "$supervised_codex")"
+assert_eq "Node Claude entrypoint remains detectable" "claude" "$(detect_tool "node /usr/local/bin/claude --resume ses_node")"
+assert_eq "Codex supervisor args normalize to real flags only" "--dangerously-bypass-approvals-and-sandbox" "$(extract_cli_args codex "$supervised_codex")"
+assert_eq "Codex duplicate bare resume tokens are stripped" "--profile fast" "$(extract_cli_args codex "codex --profile fast resume resume ses_duplicate")"
+if validate_cli_args codex "--real-codex /opt/codex"; then
+	fail "Unsafe Codex supervisor flag should be rejected"
+else
+	pass "Unsafe Codex supervisor flag is rejected"
+fi
 
 # --- Codex: state_*.sqlite thread DB (Method 3) ---
 # Codex >= ~0.118 persists thread state in SQLite. The save script queries
@@ -2740,7 +2810,7 @@ tmux set-option -g @assistant-resurrect-capture-env 'GOOD_VAR BAD$(cmd) 123NUM O
 
 RESTORE_LOG="$HOME/.tmux/resurrect/assistant-restore.log"
 rm -f "$RESTORE_LOG"
-"${TEST_BASH:-bash}" "$REPO_DIR/scripts/restore-assistant-sessions.sh" 2>/dev/null || true
+just restore 2>/dev/null || true
 
 badvar_log=$(cat "$RESTORE_LOG")
 

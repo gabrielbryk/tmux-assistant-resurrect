@@ -24,7 +24,10 @@ CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Do NOT add assistants to @resurrect-processes — that would launch bare
 # binaries (without session IDs) and the post-restore hook would then type
 # resume commands into the running TUI. The hook handles all resuming.
-tmux set-option -g @resurrect-hook-post-save-all "bash '${CURRENT_DIR}/scripts/save-assistant-sessions.sh'"
+tmux set-option -g @resurrect-companion-suffix '.assistants.json'
+tmux set-option -gq @assistant-resurrect-retain-pairs '20'
+tmux set-option -g @resurrect-hook-post-save-layout "bash '${CURRENT_DIR}/scripts/save-assistant-sessions.sh'"
+tmux set-option -g @resurrect-hook-post-save-all "bash '${CURRENT_DIR}/scripts/save-assistant-sessions.sh' --finalize"
 tmux set-option -g @resurrect-hook-post-restore-all "bash '${CURRENT_DIR}/scripts/restore-assistant-sessions.sh'"
 # Respect user's @continuum-save-interval if already set
 if [ -z "$(tmux show-option -gqv @continuum-save-interval)" ]; then

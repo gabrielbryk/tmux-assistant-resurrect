@@ -11,23 +11,41 @@
 # Handles: /path/to/claude, claude, claude --resume ..., opencode -s ..., etc.
 # Excludes: opencode run ... (LSP subprocesses)
 #
-# Limitation: patterns match any command line containing /claude, /opencode, or
-# /codex as a path component. An unrelated binary with the same name (e.g., a
-# LaTeX tool named "codex") would be falsely detected. In practice this is rare
-# inside tmux panes, but worth noting. Future: could verify identity via
-# --version or known subcommands if false positives become an issue.
 detect_tool() {
 	local args="$1"
-	case "$args" in
-	claude | claude\ * | */claude | */claude\ *) echo "claude" ;;
-	opencode | opencode\ * | */opencode | */opencode\ *)
+	# Classify the executable token, not arbitrary later argv.  In particular,
+	# codex-supervisor contains the real Codex path in its --real-codex value;
+	# matching that later token misclassifies the Python supervisor as Codex and
+	# persists the supervisor's private flags for replay.
+	local executable="${args%% *}"
+	local binary="${executable##*/}"
+	# Interpreters and shell wrappers retain the script path as argv[1]. Treat
+	# exactly that second token as the executable. This supports Node/Bun and
+	# `bash /path/to/opencode`, but does not scan arbitrary later argv such as a
+	# supervisor's `--real-codex /path/to/codex` value.
+	if [ "$args" != "$executable" ]; then
+		local remainder="${args#* }"
+		local entrypoint="${remainder%% *}"
+		case "$entrypoint" in
+		-* | '') ;;
+		*)
+			local entrypoint_binary="${entrypoint##*/}"
+			case "$entrypoint_binary" in
+			claude | opencode | codex) binary="$entrypoint_binary" ;;
+			esac
+			;;
+		esac
+	fi
+	case "$binary" in
+	claude) echo "claude" ;;
+	opencode)
 		# Exclude LSP/language server subprocesses
 		case "$args" in
 		*"opencode run "*) ;;
 		*) echo "opencode" ;;
 		esac
 		;;
-	codex | codex\ * | */codex | */codex\ *) echo "codex" ;;
+	codex) echo "codex" ;;
 	esac
 }
 
