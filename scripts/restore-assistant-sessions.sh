@@ -102,17 +102,19 @@ validate_cli_args() {
 }
 
 session_matches() {
-	local tool="$1" pid="$2" sid="$3" args="$4"
+	local tool="$1" pid="$2" sid="$3" args="$4" codex_home="${5:-}"
 	case "$tool" in
 	claude)
 		[ "$(jq -r '.session_id // empty' "$STATE_DIR/claude-${pid}.json" 2>/dev/null || true)" = "$sid" ] && return 0
 		;;
 	codex)
-		local instance
-		for instance in "${XDG_STATE_HOME:-$HOME/.local/state}/codex-supervisor/instances"/*.json; do
+		local instance state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
+		for instance in "${CODEX_SUPERVISOR_STATE_DIR:-$state_root/codex-supervisor}/instances"/*.json \
+			"$state_root"/codex-supervisor*/instances/*.json; do
 			[ -f "$instance" ] || continue
-			jq -e --arg sid "$sid" --argjson pid "$pid" \
-				'.session_id == $sid and .status == "running" and (.child_pid == $pid or .pid == $pid)' \
+			jq -e --arg sid "$sid" --arg home "$codex_home" --argjson pid "$pid" \
+				'.session_id == $sid and .status == "running" and (.child_pid == $pid or .pid == $pid)
+				 and ($home == "" or .codex_home == $home)' \
 				"$instance" >/dev/null 2>&1 && return 0
 		done
 		;;
@@ -125,7 +127,7 @@ session_matches() {
 }
 
 verify_launch() {
-	local pane="$1" tool="$2" sid="$3"
+	local pane="$1" tool="$2" sid="$3" codex_home="${4:-}"
 	local pane_pid found args observed i
 	pane_pid=$(tmux display-message -t "$pane" -p '#{pane_pid}' 2>/dev/null || true)
 	for ((i = 0; i < 20; i++)); do
@@ -133,7 +135,7 @@ verify_launch() {
 		if [ -n "$found" ]; then
 			args=$(ps -o args= -p "$found" 2>/dev/null || true)
 			observed=$(detect_tool "$args")
-			if [ "$observed" = "$tool" ] && session_matches "$tool" "$found" "$sid" "$args"; then
+			if [ "$observed" = "$tool" ] && session_matches "$tool" "$found" "$sid" "$args" "$codex_home"; then
 				return 0
 			fi
 		fi
@@ -183,6 +185,7 @@ while read -r entry; do
 	cli_args=$(echo "$entry" | jq -r '.cli_args // empty')
 	model=$(echo "$entry" | jq -r '.model // empty')
 	env_json=$(echo "$entry" | jq -c '.env // {}')
+	codex_home=$(echo "$entry" | jq -r '.codex_home // empty')
 	tmux_session="${pane%%:*}"
 
 	if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
@@ -248,6 +251,9 @@ while read -r entry; do
 			[ -n "$val" ] && env_prefix="${env_prefix}${var}=$(posix_quote "$val") "
 		done
 	fi
+	if [ "$tool" = "codex" ] && [ -n "$codex_home" ]; then
+		env_prefix="CODEX_HOME=$(posix_quote "$codex_home") ${env_prefix}"
+	fi
 
 	safe_sid=$(posix_quote "$session_id")
 	safe_cli_args=""
@@ -283,7 +289,7 @@ while read -r entry; do
 		tmux send-keys -t "$pane" "${resume_cmd}" Enter
 	fi
 
-	if verify_launch "$pane" "$tool" "$session_id"; then
+	if verify_launch "$pane" "$tool" "$session_id" "$codex_home"; then
 		if tmux capture-pane -pJ -t "$pane" -S -80 2>/dev/null | grep -qi 'resume from summary\|recommend resuming from a summary'; then
 			record_result "$pane" "$tool" "$session_id" "awaiting_confirmation" "assistant is running and awaits resume choice"
 		else

@@ -295,6 +295,9 @@ tmux new-session -d -s test-opencode-nosid -c /tmp
 tmux new-session -d -s test-lsp -c /tmp
 tmux new-session -d -s test-false-positive -c /tmp
 
+UPRISING_CODEX_HOME="$HOME/.codex-uprising"
+mkdir -p "$UPRISING_CODEX_HOME"
+
 # Launch mock assistants inside tmux panes
 # Claude: just a bare claude process (session ID comes from hook state file)
 tmux send-keys -t test-claude "claude --resume ses_claude_test_123" Enter
@@ -302,7 +305,7 @@ tmux send-keys -t test-claude "claude --resume ses_claude_test_123" Enter
 # binary overwrites its process title so -s is NOT visible in ps)
 tmux send-keys -t test-opencode "opencode -s ses_opencode_test_456" Enter
 # Codex: bare process (session ID comes from session-tags.jsonl)
-tmux send-keys -t test-codex "codex resume ses_codex_test_789" Enter
+tmux send-keys -t test-codex "CODEX_HOME=$(posix_quote "$UPRISING_CODEX_HOME") codex resume ses_codex_test_789" Enter
 # OpenCode without -s flag (no session ID available — should log warning)
 tmux send-keys -t test-opencode-nosid "opencode" Enter
 # OpenCode LSP subprocess (should be excluded from detection)
@@ -352,8 +355,7 @@ EOF
 
 # Create a Codex session-tags.jsonl entry
 codex_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$codex_pane_shell_pid" '$2 == ppid && /codex/ {print $1; exit}')
-mkdir -p "$HOME/.codex"
-echo "{\"pid\": ${codex_child_pid}, \"session\": \"ses_codex_test_789\", \"host\": \"test\", \"started_at\": \"2026-01-01T00:00:00Z\"}" >"$HOME/.codex/session-tags.jsonl"
+echo "{\"pid\": ${codex_child_pid}, \"session\": \"ses_codex_test_789\", \"host\": \"test\", \"started_at\": \"2026-01-01T00:00:00Z\"}" >"$UPRISING_CODEX_HOME/session-tags.jsonl"
 
 # Run save
 just save 2>&1
@@ -383,6 +385,8 @@ assert_eq "OpenCode session ID extracted from plugin state file" "ses_opencode_t
 # Verify Codex was detected with correct session ID (from session-tags.jsonl)
 codex_sid=$(jq -r '.sessions[] | select(.tool == "codex") | .session_id' "$SAVED")
 assert_eq "Codex session ID extracted from session-tags.jsonl" "ses_codex_test_789" "$codex_sid"
+codex_home=$(jq -r '.sessions[] | select(.tool == "codex") | .codex_home' "$SAVED")
+assert_eq "Codex manifest records secondary CODEX_HOME" "$UPRISING_CODEX_HOME" "$codex_home"
 
 # Verify LSP subprocess was excluded
 lsp_count=$(jq '[.sessions[] | select(.pane | contains("test-lsp"))] | length' "$SAVED")
@@ -527,6 +531,7 @@ assert_contains "Restore sent codex resume" "$restore_log_content" "ses_codex_te
 assert_contains "Restore uses 'command claude' prefix" "$restore_log_content" "command claude"
 assert_contains "Restore uses 'command opencode' prefix" "$restore_log_content" "command opencode"
 assert_contains "Restore uses 'command codex' prefix" "$restore_log_content" "command codex"
+assert_contains "Restore prefixes Codex with recorded secondary CODEX_HOME" "$restore_log_content" "CODEX_HOME='$UPRISING_CODEX_HOME' command codex"
 
 # --- Test 3b: Restore skips panes with already-running assistants ---
 
@@ -1021,6 +1026,26 @@ echo ""
 # and variables are defined). This replaces the fragile eval+sed extraction.
 STATE_DIR="$TEST_STATE_DIR"
 source "$REPO_DIR/scripts/save-assistant-sessions.sh"
+
+# Codex account isolation: an explicit home must control every session source.
+ALT_CODEX_HOME=$(mktemp -d "$TEST_STATE_DIR/codex-home.XXXXXX")
+printf '%s\n' '{"pid":99998,"session":"ses_alt_home"}' >"$ALT_CODEX_HOME/session-tags.jsonl"
+assert_eq "Codex reads session tags from selected CODEX_HOME" "ses_alt_home" \
+	"$(get_codex_session 99998 "codex" "/tmp" "$ALT_CODEX_HOME")"
+
+# When procfs does not expose CODEX_HOME, supervisor metadata identifies both
+# the owning home and the account-specific state tree.
+ALT_STATE_ROOT=$(mktemp -d "$TEST_STATE_DIR/codex-state.XXXXXX")
+mkdir -p "$ALT_STATE_ROOT/codex-supervisor-uprising/instances"
+printf '{"pid":88888,"child_pid":99997,"codex_home":"%s"}\n' "$ALT_CODEX_HOME" \
+	>"$ALT_STATE_ROOT/codex-supervisor-uprising/instances/88888.json"
+old_xdg_state_home="${XDG_STATE_HOME:-}"
+export XDG_STATE_HOME="$ALT_STATE_ROOT"
+assert_eq "Codex discovers secondary home from supervisor metadata" "$ALT_CODEX_HOME" \
+	"$(get_codex_home 99997)"
+if [ -n "$old_xdg_state_home" ]; then export XDG_STATE_HOME="$old_xdg_state_home"; else unset XDG_STATE_HOME; fi
+rm -rf "$ALT_STATE_ROOT"
+rm -rf "$ALT_CODEX_HOME"
 
 # --- Claude: --resume arg fallback ---
 # Method 2: extract session ID from --resume in process args

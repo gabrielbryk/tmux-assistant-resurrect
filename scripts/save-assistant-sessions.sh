@@ -189,9 +189,10 @@ get_codex_session() {
 	local child_pid="$1"
 	local args="$2"
 	local cwd="${3:-}"
+	local codex_home="${4:-${HOME}/.codex}"
 
 	# Method 1: session-tags.jsonl (written by Codex at runtime)
-	local tags_file="${HOME}/.codex/session-tags.jsonl"
+	local tags_file="${codex_home}/session-tags.jsonl"
 	if [ -f "$tags_file" ]; then
 		local sid
 		sid=$(grep "\"pid\": *${child_pid}[,}]" "$tags_file" 2>/dev/null |
@@ -231,7 +232,7 @@ get_codex_session() {
 		local etimes
 		etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$HOME/.codex" "$cwd" "$etimes" <<'PY'
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$codex_home" "$cwd" "$etimes" <<'PY'
 import glob, os, sqlite3, sys, time
 
 codex_home = sys.argv[1]
@@ -302,7 +303,7 @@ PY
 	# - preferring sessions created before the current process start time
 	# - preferring sessions closest to the current process start time
 	# - preferring recently modified rollout files
-	local sessions_root="${HOME}/.codex/sessions"
+	local sessions_root="${codex_home}/sessions"
 	if [ -n "$cwd" ] && [ -d "$sessions_root" ] && command -v python3 >/dev/null 2>&1; then
 		local etimes
 		etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
@@ -379,6 +380,28 @@ PY
 			return
 		fi
 	fi
+}
+
+get_codex_home() {
+	local pid="$1" item instance state_root
+	if [ -r "/proc/${pid}/environ" ]; then
+		while IFS= read -r -d '' item; do
+			case "$item" in
+			CODEX_HOME=*) printf '%s\n' "${item#CODEX_HOME=}"; return ;;
+			esac
+		done <"/proc/${pid}/environ" 2>/dev/null || true
+	fi
+	# The supervised child normally inherits CODEX_HOME. If procfs is hidden or
+	# restricted, fall back to the supervisor's account-qualified metadata.
+	state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
+	for instance in "${CODEX_SUPERVISOR_STATE_DIR:-$state_root/codex-supervisor}/instances"/*.json \
+		"$state_root"/codex-supervisor*/instances/*.json; do
+		[ -f "$instance" ] || continue
+		jq -er --argjson pid "$pid" \
+			'select(.child_pid == $pid or .pid == $pid) | .codex_home // empty' \
+			"$instance" 2>/dev/null && return
+	done
+	printf '%s/.codex\n' "$HOME"
 }
 
 register_codex_session_id() {
@@ -519,7 +542,7 @@ resolve_pane_candidates() {
 				[ -z "$cached_env" ] && cached_env="null"
 			fi
 
-			local session_id=""
+			local session_id="" codex_home=""
 			case "$cand_tool" in
 			claude)
 				session_id="$cached_sid"
@@ -530,7 +553,10 @@ resolve_pane_candidates() {
 				session_id="$cached_sid"
 				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_opencode_db")
 				;;
-			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
+			codex)
+				codex_home=$(get_codex_home "$cand_pid")
+				session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd" "$codex_home")
+				;;
 			esac
 
 			if [ -n "$session_id" ]; then
@@ -565,8 +591,8 @@ resolve_pane_candidates() {
 				fi
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" >>"$parts_file"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$codex_home" >>"$parts_file"
 
 				[ "$cand_tool" = "codex" ] && register_codex_session_id "$session_id"
 				resolved=1
@@ -782,7 +808,8 @@ main() {
 		jq -Rs --arg ts "$SAVE_TS" --arg layout_file "$layout_file" --arg layout_sha "$layout_sha" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null)})
+			 env:(.[7] // "null" | try fromjson catch null),
+			 codex_home:(if .[8] == "" then null else .[8] end)})
 			| {schema_version: 2, timestamp: $ts,
 			   layout: (if $layout_file == "" then null else {file:$layout_file, sha256:$layout_sha} end),
 			   sessions: .}
@@ -939,11 +966,14 @@ emit_session() {
 	local target="$1" tool="$2" cpid="$3" cargs="$4" cwd="$5"
 	local allow_opencode_db="${6:-1}"
 	local log_missing="${7:-1}"
-	local session_id=""
+	local session_id="" codex_home=""
 	case "$tool" in
 	claude) session_id=$(get_claude_session "$cpid" "$cargs") ;;
 	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db") ;;
-	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd") ;;
+	codex)
+		codex_home=$(get_codex_home "$cpid")
+		session_id=$(get_codex_session "$cpid" "$cargs" "$cwd" "$codex_home")
+		;;
 	esac
 
 	if [ -n "$session_id" ]; then
@@ -976,8 +1006,10 @@ emit_session() {
 			--arg pid "$cpid" \
 			--arg model "$model" \
 			--arg cli_args "$cli_args" \
+			--arg codex_home "$codex_home" \
 			--argjson env "${env_json:-null}" \
-			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env}' >>"$PARTS_FILE"
+			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env,
+			  codex_home: (if $codex_home == "" then null else $codex_home end)}' >>"$PARTS_FILE"
 		if [ "$tool" = "codex" ]; then
 			register_codex_session_id "$session_id"
 		fi
