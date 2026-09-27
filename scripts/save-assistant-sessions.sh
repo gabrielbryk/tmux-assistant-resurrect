@@ -191,6 +191,31 @@ get_codex_session() {
 	local cwd="${3:-}"
 	local codex_home="${4:-${HOME}/.codex}"
 
+	# Method 0: app-server attribution proxy ownership (exact).
+	# With a shared app-server the TUI never opens its rollout and writes no
+	# session-tags, so the cwd heuristic below mislabels panes (subagents,
+	# sibling threads in the same cwd). The attribution proxy records which
+	# verified codex-tui pid (SO_PEERCRED + process start time) owns which
+	# thread; trust it whenever it names exactly one thread for this pid.
+	local attribution_status="${codex_home}/app-server-attribution-proxy/status.json"
+	if [ -f "$attribution_status" ]; then
+		local pid_start sid
+		pid_start=$(awk '{print $22}' "/proc/${child_pid}/stat" 2>/dev/null || true)
+		sid=$(jq -r --arg pid "$child_pid" --arg start "$pid_start" '
+			(.connections // {}) as $conns
+			| [(.ownership // {}) | to_entries[]
+				| select(any(.value[]; ($conns[tostring] // {}) as $c
+					| ($c.pid | tostring) == $pid
+					and ($start == "" or ($c.processStartedAt | tostring) == $start)
+					and ($c.eligibleOwner // false)))
+				| .key] | unique
+			| if length == 1 then .[0] else empty end' "$attribution_status" 2>/dev/null || true)
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return
+		fi
+	fi
+
 	# Method 1: session-tags.jsonl (written by Codex at runtime)
 	local tags_file="${codex_home}/session-tags.jsonl"
 	if [ -f "$tags_file" ]; then
@@ -258,9 +283,22 @@ except sqlite3.Error:
 
 try:
     cur = con.cursor()
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(threads)")}
+    # Only interactive threads can back a TUI pane: never pick subagent
+    # threads (not resumable interactively), `codex exec` runs, or threads
+    # other clients (e.g. Claude Code's codex companion) created.
+    filters = []
+    if "thread_source" in cols:
+        filters.append("COALESCE(thread_source, '') != 'subagent'")
+    if "source" in cols:
+        filters.append("COALESCE(source, '') NOT LIKE '{\"subagent\"%'")
+        filters.append("COALESCE(source, '') != 'exec'")
+    if "originator" in cols:
+        filters.append("COALESCE(originator, '') != 'Claude Code'")
+    extra = "".join(f" AND {f}" for f in filters)
     cur.execute(
         "SELECT id, updated_at FROM threads "
-        "WHERE cwd = ? AND archived = 0 "
+        f"WHERE cwd = ? AND archived = 0{extra} "
         "ORDER BY updated_at DESC",
         (cwd,),
     )

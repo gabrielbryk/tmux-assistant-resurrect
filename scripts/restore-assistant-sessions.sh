@@ -198,6 +198,25 @@ while read -r entry; do
 		record_result "$pane" "$tool" "$session_id" "skipped" "pane does not exist"
 		continue
 	fi
+	# Manifests saved by the old cwd heuristic can name subagent threads,
+	# which `codex resume` opens as a pane nobody can drive. Skip them.
+	if [ "$tool" = "codex" ] && command -v python3 >/dev/null 2>&1; then
+		if [ "$(python3 - "${codex_home:-$HOME/.codex}" "$session_id" 2>/dev/null <<'PY'
+import glob, os, sqlite3, sys
+dbs = sorted(glob.glob(os.path.join(sys.argv[1], "state_*.sqlite")), key=os.path.getmtime)
+if dbs:
+    con = sqlite3.connect(f"file:{dbs[-1]}?mode=ro", uri=True)
+    row = con.execute(
+        "SELECT 1 FROM threads WHERE id = ? AND (thread_source = 'subagent'"
+        " OR source LIKE '{\"subagent\"%')", (sys.argv[2],)).fetchone()
+    print(1 if row else 0)
+PY
+		)" = 1 ]; then
+			log "codex thread $session_id in $pane is a subagent, skipping"
+			record_result "$pane" "$tool" "$session_id" "skipped" "codex subagent thread"
+			continue
+		fi
+	fi
 
 	case "$WAITED_SESSIONS" in
 	*"|$tmux_session|"*) ;;
